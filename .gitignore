@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+
+# PyInstaller build artifacts
+build/Enigma/
+build/Enigma.spec
+*.spec
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Sensitive files - NEVER commit user keyfiles or their data
+*.keyfile
+encrypted/
+decrypted/
+
+# Sample-generated files (keep the script, not the regenerable output)
+sample/sample_game_data.xlsx
