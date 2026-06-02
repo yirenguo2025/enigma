@@ -154,7 +154,14 @@ class EncryptPanel(QWidget):
                 self.cols_table.setCellWidget(row, 0, cb)
 
                 self.cols_table.setItem(row, 1, QTableWidgetItem(sheet_name))
-                self.cols_table.setItem(row, 2, QTableWidgetItem(str(col)))
+
+                # Mark numeric columns so the user notices the type-loss caveat.
+                is_numeric = pd.api.types.is_numeric_dtype(df[col])
+                col_label = f"{col}  （数字列⚠）" if is_numeric else str(col)
+                col_item = QTableWidgetItem(col_label)
+                # Stash the raw column name + numeric flag for later lookup.
+                col_item.setData(Qt.ItemDataRole.UserRole, (str(col), is_numeric))
+                self.cols_table.setItem(row, 2, col_item)
 
                 edit = QLineEdit()
                 edit.setPlaceholderText("例：GAME（不填则用 COL{n}）")
@@ -173,7 +180,8 @@ class EncryptPanel(QWidget):
             cb: QCheckBox = self.cols_table.cellWidget(r, 0)
             if not cb.isChecked():
                 continue
-            col_name = self.cols_table.item(r, 2).text()
+            stored = self.cols_table.item(r, 2).data(Qt.ItemDataRole.UserRole)
+            col_name = stored[0] if stored else self.cols_table.item(r, 2).text()
             edit: QLineEdit = self.cols_table.cellWidget(r, 3)
             prefix = edit.text().strip().upper()
             if not prefix:
@@ -185,6 +193,20 @@ class EncryptPanel(QWidget):
                 )
             mapping[col_name] = prefix
         return mapping
+
+    def collect_numeric_checked(self) -> List[str]:
+        """Returns the list of CHECKED column names that are numeric dtype."""
+        out: List[str] = []
+        for r in range(self.cols_table.rowCount()):
+            cb: QCheckBox = self.cols_table.cellWidget(r, 0)
+            if not cb.isChecked():
+                continue
+            stored = self.cols_table.item(r, 2).data(Qt.ItemDataRole.UserRole)
+            if stored and stored[1]:  # is_numeric
+                out.append(stored[0])
+        # dedupe while preserving order
+        seen = set()
+        return [c for c in out if not (c in seen or seen.add(c))]
 
     def do_encrypt(self):
         proj = self._get_project()
@@ -198,6 +220,23 @@ class EncryptPanel(QWidget):
         if not mapping:
             QMessageBox.information(self, "请选择列", "请至少勾选一列要脱敏。")
             return
+
+        # Warn if numeric columns are about to be tokenized.
+        numeric_checked = self.collect_numeric_checked()
+        if numeric_checked:
+            cols_str = "、".join(f"「{c}」" for c in numeric_checked)
+            reply = QMessageBox.warning(
+                self,
+                "勾选了数字列",
+                f"你勾选了 {len(numeric_checked)} 个数字列：{cols_str}\n\n"
+                "脱敏后这些列会变成字符串，还原后类型也是字符串（不是数字），"
+                "下游 Excel 公式或求和操作可能失效。\n\n"
+                "确定继续吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         try:
             result = encrypt_file(proj, self._input_path, mapping)
@@ -418,9 +457,22 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "项目名称", "为这个项目起个名字：")
         if not ok or not name.strip():
             return
-        password = self._ask_password("设置密码", "为密钥文件设置密码（请记牢，不可找回）：")
-        if not password:
-            return
+        # Loop until user supplies a password meeting the minimum bar, or cancels.
+        while True:
+            password = self._ask_password(
+                "设置密码", "为密钥文件设置密码（至少 8 位，建议含字母+数字）：\n密码丢失无法找回。"
+            )
+            if password is None:
+                return  # cancelled
+            if len(password) < 8:
+                QMessageBox.warning(
+                    self,
+                    "密码太短",
+                    "密码至少需要 8 位。\n\n"
+                    "弱密码会让攻击者拿到 keyfile 后能快速离线爆破出你的映射表。",
+                )
+                continue
+            break
         confirm = self._ask_password("确认密码", "再输一次刚才的密码：")
         if password != confirm:
             QMessageBox.warning(self, "密码不一致", "两次输入的密码不一致。")

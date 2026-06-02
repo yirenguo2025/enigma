@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -115,7 +115,7 @@ def build_prompt_template(project: Project, column_prefix_map: Dict[str, str]) -
     (column name, prefix, count of unique values).
     """
     lines: List[str] = [
-        "我提供的表格中，以下列已经过本地加密处理，加密只是把字面值替换为占位符，",
+        "我提供的表格中，以下列已经过本地脱敏处理，脱敏只是把字面值替换为占位符，",
         "不影响数据之间的关系。请基于这些字段的语义角色进行分析。",
         "",
     ]
