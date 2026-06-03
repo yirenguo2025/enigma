@@ -1,12 +1,13 @@
-"""Encryption workflow: take an input file + column->prefix mapping,
-produce a tokenized output file and update the project mapping.
+"""Encryption workflow: take an input file + selection of columns to
+tokenize / affine-transform, plus a project-wide date offset, and produce
+an encrypted output file.
 """
 
 from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -20,16 +21,18 @@ class EncryptResult:
     output_path: str
     rows_affected: int
     columns_processed: List[str]
-    new_tokens_per_prefix: Dict[str, int]   # prefix -> number of NEW tokens added
-    total_tokens_per_prefix: Dict[str, int] # prefix -> total tokens after this op
-    prompt_template: str
+    new_tokens_per_prefix: Dict[str, int]
+    total_tokens_per_prefix: Dict[str, int]
+    numeric_columns: List[str] = field(default_factory=list)
+    date_columns_shifted: List[str] = field(default_factory=list)
+    date_offset_days: int = 0
+    prompt_template: str = ""
 
 
 def _suggest_output_path(input_path: str, project_dir: str) -> str:
     base, ext = os.path.splitext(os.path.basename(input_path))
     out_dir = os.path.join(project_dir, "encrypted")
     os.makedirs(out_dir, exist_ok=True)
-    # Always force .xlsx if input was .xls (we can't write .xls).
     if ext.lower() == ".xls":
         ext = ".xlsx"
     return os.path.join(out_dir, f"{base}_encrypted{ext}")
@@ -39,34 +42,72 @@ def encrypt_file(
     project: Project,
     input_path: str,
     column_prefix_map: Dict[str, str],
+    numeric_columns: Optional[List[str]] = None,
     output_path: Optional[str] = None,
 ) -> EncryptResult:
     """Encrypt selected columns of a file.
 
-    column_prefix_map: {column_name: prefix}, where column_name MUST exist in
-    every sheet that contains it. Columns not in the map are left untouched.
-    Prefixes are user-chosen and shared project-wide (same prefix used in
-    different files will produce consistent tokens for the same value).
+    Args:
+        column_prefix_map: {column_name: prefix} for TEXT columns that get
+            tokenized to PREFIX_xxxx placeholders.
+        numeric_columns: List of column names whose VALUES will be passed
+            through an affine transform (y = a*x + b, per-column random pair
+            stored in the project keyfile). The user can fully recover originals
+            on decrypt.
+
+    Date columns: ALL detected datetime columns are automatically shifted by
+    project.date_offset_days. No opt-in needed - if the user doesn't want
+    this, they should convert dates to strings before running the tool.
     """
+    numeric_columns = list(numeric_columns or [])
+
     workbook = file_io.load(input_path)
 
-    # Register all column->prefix bindings before tokenizing so we fail fast
-    # on conflicts.
+    # Register text-column prefixes (idempotent).
     for col, prefix in column_prefix_map.items():
         project.tokenizer.register_column(col, prefix.upper())
+    # Register numeric columns (allocates random (a, b) per column on first sight).
+    for col in numeric_columns:
+        project.numeric.register(col)
+    # Lazy migration: legacy v1 projects had no date offset.
+    project.ensure_date_offset()
 
     before_counts = {p: c for p, c in project.tokenizer.counters.items()}
 
     rows_affected = 0
-    cols_seen: set = set()
+    text_cols_seen: set = set()
+    numeric_cols_seen: set = set()
+    date_cols_seen: set = set()
+    offset = pd.Timedelta(days=project.date_offset_days)
+
     for sheet_name, df in workbook.items():
+        # 1. Text columns -> tokenize
         for col, prefix in column_prefix_map.items():
             if col not in df.columns:
                 continue
-            cols_seen.add(col)
-            # Apply tokenization element-wise. We coerce to string for hashing
-            # consistency (the tokenizer itself preserves None/NaN/empty).
-            df[col] = df[col].map(lambda v, p=prefix: project.tokenizer.tokenize(p, v))
+            text_cols_seen.add(col)
+            df[col] = df[col].map(
+                lambda v, p=prefix: project.tokenizer.tokenize(p, v)
+            )
+
+        # 2. Numeric columns -> affine transform
+        for col in numeric_columns:
+            if col not in df.columns:
+                continue
+            if not pd.api.types.is_numeric_dtype(df[col]):
+                # Column was opted in for numeric encryption but isn't actually
+                # numeric in this sheet (could be mixed dtype across sheets).
+                # Coerce to numeric where possible; non-numeric values pass through.
+                pass
+            numeric_cols_seen.add(col)
+            df[col] = df[col].map(lambda v, c=col: project.numeric.encrypt(c, v))
+
+        # 3. Date columns -> shift by project offset
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                date_cols_seen.add(col)
+                df[col] = df[col] + offset
+
         rows_affected += len(df)
 
     if output_path is None:
@@ -81,58 +122,87 @@ def encrypt_file(
     }
     total_per_prefix = {p: after_counts.get(p, 0) for p in column_prefix_map.values()}
 
-    # Persist updated mapping immediately - one of the most important guarantees:
-    # we never have a tokenized file on disk whose mapping isn't saved yet.
     project.add_history(
         HistoryEntry(
             timestamp=time.time(),
             action="encrypt",
             source_file=os.path.abspath(input_path),
             output_file=os.path.abspath(output_path),
-            columns=sorted(cols_seen),
+            columns=sorted(text_cols_seen | numeric_cols_seen | date_cols_seen),
             rows_affected=rows_affected,
         )
     )
     project.save()
 
-    prompt = build_prompt_template(project, column_prefix_map)
+    prompt = build_prompt_template(
+        project,
+        column_prefix_map,
+        sorted(numeric_cols_seen),
+        sorted(date_cols_seen),
+    )
 
     return EncryptResult(
         output_path=output_path,
         rows_affected=rows_affected,
-        columns_processed=sorted(cols_seen),
+        columns_processed=sorted(text_cols_seen | numeric_cols_seen),
         new_tokens_per_prefix=new_per_prefix,
         total_tokens_per_prefix=total_per_prefix,
+        numeric_columns=sorted(numeric_cols_seen),
+        date_columns_shifted=sorted(date_cols_seen),
+        date_offset_days=project.date_offset_days,
         prompt_template=prompt,
     )
 
 
-def build_prompt_template(project: Project, column_prefix_map: Dict[str, str]) -> str:
-    """Generate the prompt the user should paste into their AI tool, declaring
-    which columns are encrypted and what each prefix means semantically.
+def build_prompt_template(
+    project: Project,
+    column_prefix_map: Dict[str, str],
+    numeric_columns: List[str],
+    date_columns_shifted: List[str],
+) -> str:
+    """Generate the AI prompt declaring which columns are transformed and how.
 
-    The prompt does NOT reveal any original values - only structural metadata
-    (column name, prefix, count of unique values).
+    Reveals NO original values - only structural metadata (column name,
+    prefix, count of distinct values, that numeric/date transforms were
+    applied). The transforms themselves (a, b, offset) stay in the keyfile.
     """
     lines: List[str] = [
-        "我提供的表格中，以下列已经过本地脱敏处理，脱敏只是把字面值替换为占位符，",
-        "不影响数据之间的关系。请基于这些字段的语义角色进行分析。",
+        "我提供的表格中，以下列已经过本地脱敏处理，请基于这些字段的语义角色进行分析。",
+        "脱敏只改变字面值或数值，不影响行/列结构和数据之间的关系。",
         "",
     ]
-    for col, prefix in column_prefix_map.items():
-        prefix = prefix.upper()
-        unique_count = len(project.tokenizer.forward.get(prefix, {}))
-        lines.append(
-            f"- 列「{col}」：原本是该业务实体名称，已替换为 `{prefix}_xxx` 形式占位符。"
-            f"共 {unique_count} 个不同取值；相同占位符代表同一个实体。"
-        )
+    if column_prefix_map:
+        lines.append("【文本占位符列】（值被替换为占位符，相同占位符代表同一原值）：")
+        for col, prefix in column_prefix_map.items():
+            prefix = prefix.upper()
+            unique_count = len(project.tokenizer.forward.get(prefix, {}))
+            lines.append(
+                f"  - 「{col}」→ `{prefix}_xxxx`（共 {unique_count} 个不同值）"
+            )
+        lines.append("")
+
+    if numeric_columns:
+        lines.append("【数值仿射变换列】（每列做了 y = a·x + b 的可逆变换，"
+                     "绝对量级不可信，但比例、增长率、相关性、求和都精确）：")
+        for col in numeric_columns:
+            lines.append(f"  - 「{col}」")
+        lines.append("  分析结果中的具体数字不代表真实数量级，但相对结论有效。")
+        lines.append("")
+
+    if date_columns_shifted:
+        lines.append("【日期偏移列】（所有日期被统一平移了同一个未知天数，"
+                     "时间间隔、星期、季节性保留）：")
+        for col in date_columns_shifted:
+            lines.append(f"  - 「{col}」")
+        lines.append("  绝对日期不可信，但相对时序、周期分析有效。")
+        lines.append("")
+
     lines.extend(
         [
-            "",
             "未在上述列表中的列均为原始数据，可以直接分析。",
             "",
-            "在你的输出中，请直接保留占位符（如 `GAME_0001`）。",
-            "我会在本地把它们还原成真实名称。",
+            "在你的输出中，请保留占位符（如 `GAME_0001`）和变换后的数值/日期不变。",
+            "我会在本地把它们还原成真实值。",
         ]
     )
     return "\n".join(lines)

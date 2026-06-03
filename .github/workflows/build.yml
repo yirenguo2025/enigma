@@ -11,13 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            artifact_name: Enigma-windows
-            executable: dist/Enigma.exe
-          - os: macos-latest
-            artifact_name: Enigma-macos
-            executable: dist/Enigma.app
+        os: [windows-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
 
@@ -35,6 +29,13 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Read version
+        id: ver
+        shell: bash
+        run: |
+          VERSION=$(python -c "exec(open('core/version.py').read()); print(__version__)")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
       - name: Build with PyInstaller
         run: python build/build.py
 
@@ -42,13 +43,18 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cd dist
-          zip -r Enigma-macos.zip Enigma.app
+          zip -r Enigma-v${{ steps.ver.outputs.version }}-macos.zip "Enigma-v${{ steps.ver.outputs.version }}.app"
 
-      - name: Upload artifact
+      - name: Upload artifact (macOS)
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: |
-            dist/Enigma.exe
-            dist/Enigma-macos.zip
-          if-no-files-found: ignore
+          name: Enigma-v${{ steps.ver.outputs.version }}-macos
+          path: dist/Enigma-v${{ steps.ver.outputs.version }}-macos.zip
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Enigma-v${{ steps.ver.outputs.version }}-windows
+          path: dist/Enigma-v${{ steps.ver.outputs.version }}.exe

@@ -143,6 +143,60 @@ def main():
     assert list(out_sheets["2021"]["流水"]) == [100, 200]
     print(f"✓ Multi-sheet: 原神 -> {tok_yuanshen} consistent across all 3 sheets")
 
+    # 9. Numeric affine transform + date offset regression test
+    print("\n--- Numeric affine + date offset round-trip test ---")
+    affine_src = os.path.join(workdir, "with_dates.xlsx")
+    df_affine = pd.DataFrame({
+        "日期": pd.to_datetime(["2024-01-15", "2024-02-20", "2024-03-25"]),
+        "游戏名": ["原神", "王者荣耀", "蛋仔派对"],
+        "流水": [1200.0, 800.5, 600.25],
+        "DAU": [50000, 80000, 30000],
+    })
+    df_affine.to_excel(affine_src, index=False)
+
+    affine_kf = os.path.join(workdir, "affine.keyfile")
+    proj_affine = Project.create(affine_kf, name="affine_test", password="password123")
+    # Verify a non-zero date offset was generated at creation
+    assert proj_affine.date_offset_days != 0, "New project should auto-generate non-zero date offset"
+    print(f"  date offset: {proj_affine.date_offset_days} days")
+
+    affine_res = encrypt_file(
+        proj_affine,
+        affine_src,
+        column_prefix_map={"游戏名": "GAME"},
+        numeric_columns=["流水", "DAU"],
+    )
+    enc_df = pd.read_excel(affine_res.output_path)
+    # Verify dates were shifted
+    expected_shift = pd.Timedelta(days=proj_affine.date_offset_days)
+    assert (enc_df["日期"][0] - df_affine["日期"][0]) == expected_shift, "Date not shifted"
+    # Verify numeric columns were transformed (not equal to originals)
+    assert not (enc_df["流水"] == df_affine["流水"]).all(), "流水 should be transformed"
+    assert not (enc_df["DAU"] == df_affine["DAU"]).all(), "DAU should be transformed"
+    # Verify game names were tokenized
+    assert all(str(v).startswith("GAME_") for v in enc_df["游戏名"]), "游戏名 should be tokenized"
+    print(f"  Sample row encrypted: 流水={enc_df['流水'][0]:.2f}, DAU={enc_df['DAU'][0]:.2f}, "
+          f"日期={enc_df['日期'][0].date()}")
+    print(f"  Generated prompt:\n{affine_res.prompt_template[:300]}...")
+
+    # Now decrypt and verify exact recovery
+    proj_affine2 = Project.open(affine_kf, password="password123")
+    dec_res = decrypt_file(proj_affine2, affine_res.output_path)
+    rest_df = pd.read_excel(dec_res.output_path)
+    # Game names back to originals
+    assert list(rest_df["游戏名"]) == list(df_affine["游戏名"]), \
+        f"游戏名 not restored: {list(rest_df['游戏名'])}"
+    # Numeric columns back to originals (within float precision)
+    for col in ["流水", "DAU"]:
+        for orig, rest in zip(df_affine[col], rest_df[col]):
+            assert abs(orig - rest) < 1e-6, f"{col}: {orig} != {rest}"
+    # Dates back to originals
+    for orig, rest in zip(df_affine["日期"], rest_df["日期"]):
+        assert orig == rest, f"date: {orig} != {rest}"
+    print(f"  ✓ Affine + date round-trip: all values match (流水, DAU, 日期, 游戏名)")
+    print(f"  Sample restored: 流水={rest_df['流水'][0]}, DAU={rest_df['DAU'][0]}, "
+          f"日期={rest_df['日期'][0].date()}")
+
     print(f"\nKept workdir for inspection: {workdir}")
 
 

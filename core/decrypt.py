@@ -38,6 +38,8 @@ class DecryptResult:
     tokens_restored: int
     unknown_tokens: Dict[str, int] = field(default_factory=dict)  # token -> count
     columns_touched: List[str] = field(default_factory=list)
+    numeric_columns_restored: List[str] = field(default_factory=list)
+    date_columns_restored: List[str] = field(default_factory=list)
 
 
 def _suggest_output_path(input_path: str, project_dir: str) -> str:
@@ -89,20 +91,38 @@ def decrypt_file(
     input_path: str,
     output_path: Optional[str] = None,
 ) -> DecryptResult:
-    """Read input_path, replace tokens with originals, write output."""
+    """Read input_path, undo tokens / numeric / date transforms, write output."""
     workbook = file_io.load(input_path)
     reverse_map = project.tokenizer.all_reverse()
     known_prefixes = set(project.tokenizer.forward.keys())
+    numeric_cols_known = set(project.numeric.transforms.keys())
+    offset = pd.Timedelta(days=project.date_offset_days) if project.date_offset_days else None
 
     stats: Dict[str, int] = {}
     unknowns: Dict[str, int] = {}
     rows = 0
     cols_touched: Set[str] = set()
+    numeric_restored: Set[str] = set()
+    date_restored: Set[str] = set()
 
     for sheet_name, df in workbook.items():
         rows += len(df)
         for col in df.columns:
-            # Only process object/string columns; numeric columns can't contain tokens.
+            # 1. Numeric column registered in this project? Apply inverse affine.
+            if col in numeric_cols_known and pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].map(lambda v, c=col: project.numeric.decrypt(c, v))
+                numeric_restored.add(col)
+                cols_touched.add(col)
+                continue
+
+            # 2. Datetime column? Apply inverse offset.
+            if offset is not None and pd.api.types.is_datetime64_any_dtype(df[col]):
+                df[col] = df[col] - offset
+                date_restored.add(col)
+                cols_touched.add(col)
+                continue
+
+            # 3. String/object column? Look for tokens.
             if not pd.api.types.is_object_dtype(df[col]) and not pd.api.types.is_string_dtype(df[col]):
                 continue
             had_token = False
@@ -148,4 +168,6 @@ def decrypt_file(
         tokens_restored=stats.get("restored", 0),
         unknown_tokens=unknowns,
         columns_touched=sorted(cols_touched),
+        numeric_columns_restored=sorted(numeric_restored),
+        date_columns_restored=sorted(date_restored),
     )

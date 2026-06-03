@@ -49,6 +49,8 @@ from core.crypto import KeyfileError, WrongPassword
 from core.decrypt import decrypt_file
 from core.encrypt import encrypt_file
 from core.project import Project
+from core.version import __version__
+from core.version import __version__
 
 
 KEYFILE_FILTER = "Enigma 密钥文件 (*.keyfile)"
@@ -84,8 +86,10 @@ class EncryptPanel(QWidget):
         # Hint above the columns table
         hint = QLabel(
             "默认已勾选所有非数值列，请检查。"
-            "建议尽可能脱敏不需要用于后续数值计算的信息，"
-            "以尽可能脱敏并防止信息反推。"
+            "建议尽可能脱敏不需要用于后续数值计算的信息，以防止信息反推。\n"
+            "数字列：勾选后采用仿射变换（y=a·x+b），AI 算出的数值能精确还原。\n"
+            "日期列：项目级统一偏移随机天数（保留时间间隔），自动应用，无需勾选。\n"
+            "⚠ 如果勾选数字和日期相关列脱敏，后续完成处理和还原后，请检查还原后数据的准确性。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(
@@ -97,7 +101,7 @@ class EncryptPanel(QWidget):
         # Columns table
         self.cols_table = QTableWidget(0, 4)
         self.cols_table.setHorizontalHeaderLabels(
-            ["脱敏", "出现于", "列名", "Token 前缀（如 GAME / TYPE）"]
+            ["脱敏", "出现于", "列名", "Token 前缀（数字列自动）"]
         )
         self.cols_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
@@ -156,33 +160,41 @@ class EncryptPanel(QWidget):
         proj = self._get_project()
         existing = proj.tokenizer.prefixes if proj else {}
 
-        # col_name -> {"sheets": [str], "all_numeric": bool}
+        # col_name -> {"sheets": [str], "all_numeric": bool, "any_date": bool}
         seen: Dict[str, dict] = {}
         for sheet_name, df in self._workbook.items():
             for col in df.columns:
                 col_str = str(col)
                 is_numeric = pd.api.types.is_numeric_dtype(df[col])
+                is_date = pd.api.types.is_datetime64_any_dtype(df[col])
                 info = seen.setdefault(
-                    col_str, {"sheets": [], "all_numeric": True}
+                    col_str,
+                    {"sheets": [], "all_numeric": True, "any_date": False},
                 )
                 info["sheets"].append(sheet_name)
-                # Treat as numeric only if EVERY occurrence is numeric.
-                # If any sheet has it as object/string, the column has mixed
-                # use and the type-loss warning isn't really applicable.
                 info["all_numeric"] = info["all_numeric"] and is_numeric
+                info["any_date"] = info["any_date"] or is_date
 
         for col_name, info in seen.items():
             row = self.cols_table.rowCount()
             self.cols_table.insertRow(row)
 
+            is_numeric = info["all_numeric"]
+            is_date = info["any_date"]
+
             cb = QCheckBox()
             cb.setStyleSheet("margin-left: 8px;")
-            # Default-check all non-numeric columns. If a column was previously
-            # bound in this project, also check it (preserve user intent).
-            is_numeric = info["all_numeric"]
-            should_check = (col_name in existing) or (not is_numeric)
-            if should_check:
+            if is_date:
+                # Date columns are handled automatically by the project-level
+                # date offset; user doesn't need to (and can't) opt in/out per file.
                 cb.setChecked(True)
+                cb.setEnabled(False)
+            else:
+                # Default-check non-numeric (text) columns. Numeric columns
+                # default unchecked. Previously bound columns are checked.
+                should_check = (col_name in existing) or (not is_numeric)
+                if should_check:
+                    cb.setChecked(True)
             self.cols_table.setCellWidget(row, 0, cb)
 
             # "Where" cell: list sheets, with a count if there are multiple.
@@ -193,89 +205,101 @@ class EncryptPanel(QWidget):
                 where = f"{len(sheets)} 个 sheet（{', '.join(sheets)}）"
             self.cols_table.setItem(row, 1, QTableWidgetItem(where))
 
-            # Mark numeric columns so the user notices the type-loss caveat.
-            col_label = f"{col_name}  （数字列⚠）" if is_numeric else col_name
+            # Tag columns by type so the user understands the treatment.
+            if is_date:
+                col_label = f"{col_name}  [日期·自动偏移]"
+            elif is_numeric:
+                col_label = f"{col_name}  [数字]"
+            else:
+                col_label = col_name
             col_item = QTableWidgetItem(col_label)
-            col_item.setData(Qt.ItemDataRole.UserRole, (col_name, is_numeric))
+            # Stash (col_name, kind) for later. kind ∈ {"text","numeric","date"}
+            kind = "date" if is_date else ("numeric" if is_numeric else "text")
+            col_item.setData(Qt.ItemDataRole.UserRole, (col_name, kind))
             self.cols_table.setItem(row, 2, col_item)
 
             edit = QLineEdit()
-            edit.setPlaceholderText("例：GAME（不填则用 COL{n}）")
-            if col_name in existing:
-                edit.setText(existing[col_name])
+            if is_date:
+                edit.setText("—（项目级统一偏移）")
+                edit.setEnabled(False)
+                edit.setStyleSheet("color: #888; background: #f5f5f5;")
+            elif is_numeric:
+                edit.setText("—（自动仿射变换）")
+                edit.setEnabled(False)
+                edit.setStyleSheet("color: #888; background: #f5f5f5;")
+            else:
+                edit.setPlaceholderText("例：GAME（不填则用 COL{n}）")
+                if col_name in existing:
+                    edit.setText(existing[col_name])
             self.cols_table.setCellWidget(row, 3, edit)
 
-    def collect_mapping(self) -> Dict[str, str]:
-        """Read the table and produce {column_name: prefix}.
-        We dedupe by column name (project-level): if the same column appears
-        in multiple sheets, all share the same prefix.
+    def collect_selections(self) -> Dict[str, object]:
+        """Read the table and produce:
+            {"text": {col_name: prefix}, "numeric": [col_name]}
+
+        Date columns are NOT returned here — they're handled automatically
+        by encrypt_file based on dtype detection.
         """
-        mapping: Dict[str, str] = {}
+        text_map: Dict[str, str] = {}
+        numeric_cols: List[str] = []
         auto_idx = 1
         for r in range(self.cols_table.rowCount()):
             cb: QCheckBox = self.cols_table.cellWidget(r, 0)
             if not cb.isChecked():
                 continue
             stored = self.cols_table.item(r, 2).data(Qt.ItemDataRole.UserRole)
-            col_name = stored[0] if stored else self.cols_table.item(r, 2).text()
+            if not stored:
+                continue
+            col_name, kind = stored
+            if kind == "date":
+                # Auto-handled, skip
+                continue
+            if kind == "numeric":
+                if col_name not in numeric_cols:
+                    numeric_cols.append(col_name)
+                continue
+            # text
             edit: QLineEdit = self.cols_table.cellWidget(r, 3)
             prefix = edit.text().strip().upper()
             if not prefix:
                 prefix = f"COL{auto_idx}"
                 auto_idx += 1
-            if col_name in mapping and mapping[col_name] != prefix:
+            if col_name in text_map and text_map[col_name] != prefix:
                 raise ValueError(
                     f"列「{col_name}」被指定了两个不同的前缀，请确认。"
                 )
-            mapping[col_name] = prefix
-        return mapping
-
-    def collect_numeric_checked(self) -> List[str]:
-        """Returns the list of CHECKED column names that are numeric dtype."""
-        out: List[str] = []
-        for r in range(self.cols_table.rowCount()):
-            cb: QCheckBox = self.cols_table.cellWidget(r, 0)
-            if not cb.isChecked():
-                continue
-            stored = self.cols_table.item(r, 2).data(Qt.ItemDataRole.UserRole)
-            if stored and stored[1]:  # is_numeric
-                out.append(stored[0])
-        # dedupe while preserving order
-        seen = set()
-        return [c for c in out if not (c in seen or seen.add(c))]
+            text_map[col_name] = prefix
+        return {"text": text_map, "numeric": numeric_cols}
 
     def do_encrypt(self):
         proj = self._get_project()
         if proj is None or not self._input_path:
             return
         try:
-            mapping = self.collect_mapping()
+            sel = self.collect_selections()
         except ValueError as e:
             QMessageBox.warning(self, "列设置有冲突", str(e))
             return
-        if not mapping:
+        text_map: Dict[str, str] = sel["text"]
+        numeric_cols: List[str] = sel["numeric"]
+        # Dates are auto-handled; check if there are any so we don't block
+        # the user when they only have date columns.
+        has_dates = any(
+            pd.api.types.is_datetime64_any_dtype(df[col])
+            for df in self._workbook.values()
+            for col in df.columns
+        )
+        if not text_map and not numeric_cols and not has_dates:
             QMessageBox.information(self, "请选择列", "请至少勾选一列要脱敏。")
             return
 
-        # Warn if numeric columns are about to be tokenized.
-        numeric_checked = self.collect_numeric_checked()
-        if numeric_checked:
-            cols_str = "、".join(f"「{c}」" for c in numeric_checked)
-            reply = QMessageBox.warning(
-                self,
-                "勾选了数字列",
-                f"你勾选了 {len(numeric_checked)} 个数字列：{cols_str}\n\n"
-                "脱敏后这些列会变成字符串，还原后类型也是字符串（不是数字），"
-                "下游 Excel 公式或求和操作可能失效。\n\n"
-                "确定继续吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
         try:
-            result = encrypt_file(proj, self._input_path, mapping)
+            result = encrypt_file(
+                proj,
+                self._input_path,
+                column_prefix_map=text_map,
+                numeric_columns=numeric_cols,
+            )
         except Exception as e:
             traceback.print_exc()
             QMessageBox.critical(self, "脱敏失败", f"{type(e).__name__}: {e}")
@@ -284,13 +308,25 @@ class EncryptPanel(QWidget):
         self.prompt_text.setPlainText(result.prompt_template)
         self._log(
             f"✓ 脱敏完成：{result.output_path}（{result.rows_affected} 行；"
-            f"新增 token：{result.new_tokens_per_prefix}）"
+            f"文本 token：{result.new_tokens_per_prefix}；"
+            f"数字列仿射：{len(result.numeric_columns)}；"
+            f"日期偏移：{len(result.date_columns_shifted)} 列）"
         )
+
+        details = []
+        if result.new_tokens_per_prefix:
+            details.append(f"文本 token 新增：{result.new_tokens_per_prefix}")
+        if result.numeric_columns:
+            details.append(f"数字列已仿射变换：{result.numeric_columns}")
+        if result.date_columns_shifted:
+            details.append(
+                f"日期列已偏移（共 {len(result.date_columns_shifted)} 列）"
+            )
         QMessageBox.information(
             self,
             "脱敏完成",
             f"已生成：\n{result.output_path}\n\n"
-            f"处理 {result.rows_affected} 行；本次新增 token：{result.new_tokens_per_prefix}",
+            f"处理 {result.rows_affected} 行。\n" + "\n".join(details),
         )
 
 
@@ -362,7 +398,9 @@ class DecryptPanel(QWidget):
         lines = [
             f"输出文件：{result.output_path}",
             f"处理行数：{result.rows_processed}",
-            f"成功还原 token 数：{result.tokens_restored}",
+            f"成功还原文本 token：{result.tokens_restored}",
+            f"还原数字列（仿射逆变换）：{', '.join(result.numeric_columns_restored) or '（无）'}",
+            f"还原日期列（偏移逆变换）：{', '.join(result.date_columns_restored) or '（无）'}",
             f"涉及列：{', '.join(result.columns_touched) or '（无）'}",
         ]
         if result.unknown_tokens:
@@ -375,6 +413,8 @@ class DecryptPanel(QWidget):
         self.report_text.setPlainText("\n".join(lines))
         self._log(
             f"✓ 还原完成：{result.output_path}（{result.tokens_restored} 个 token，"
+            f"{len(result.numeric_columns_restored)} 个数字列，"
+            f"{len(result.date_columns_restored)} 个日期列，"
             f"{len(result.unknown_tokens)} 个未识别）"
         )
 
@@ -427,7 +467,7 @@ class HistoryPanel(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Enigma — 本地数据脱敏工具")
+        self.setWindowTitle(f"Enigma v{__version__} — 本地数据脱敏工具")
         self.resize(960, 720)
 
         self._project: Optional[Project] = None
