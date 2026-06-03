@@ -53,7 +53,14 @@ class Tokenizer:
     # ---------- prefix management ----------
 
     def register_column(self, column_name: str, prefix: str) -> None:
-        """Bind a logical column name to a prefix. Idempotent if same prefix."""
+        """Bind a logical column name to a prefix. Idempotent if same prefix.
+
+        Multiple column names CAN share the same prefix — they will share
+        a token vocabulary. This is sometimes desired (e.g., "游戏名" and
+        "游戏名称" across different files should yield the same tokens for
+        the same game). The Tokenizer keys mappings by (prefix, value) so
+        cross-column sharing is safe and intentional.
+        """
         prefix = prefix.upper()
         if not PREFIX_RE.match(prefix):
             raise ValueError(
@@ -66,13 +73,6 @@ class Tokenizer:
                 f"Column '{column_name}' already bound to prefix '{existing}'. "
                 f"Cannot rebind to '{prefix}'."
             )
-        # Make sure no two columns share the same prefix (would corrupt mapping).
-        for col, pfx in self.prefixes.items():
-            if pfx == prefix and col != column_name:
-                raise ValueError(
-                    f"Prefix '{prefix}' is already used by column '{col}'. "
-                    "Choose a different prefix."
-                )
         self.prefixes[column_name] = prefix
         self.forward.setdefault(prefix, {})
         self.counters.setdefault(prefix, 0)

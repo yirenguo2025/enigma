@@ -84,7 +84,7 @@ class EncryptPanel(QWidget):
         # Columns table
         self.cols_table = QTableWidget(0, 4)
         self.cols_table.setHorizontalHeaderLabels(
-            ["脱敏", "Sheet", "列名", "Token 前缀（如 GAME / TYPE）"]
+            ["脱敏", "出现于", "列名", "Token 前缀（如 GAME / TYPE）"]
         )
         self.cols_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
@@ -136,38 +136,58 @@ class EncryptPanel(QWidget):
         self.encrypt_btn.setEnabled(self._get_project() is not None)
 
     def _populate_columns(self):
-        # Build a row per (sheet, column).
+        # Dedupe columns by NAME across sheets. Same column name in multiple
+        # sheets must share one prefix (this is the project-level consistency
+        # the user expects), so the UI shows one row per unique column name.
         self.cols_table.setRowCount(0)
         proj = self._get_project()
         existing = proj.tokenizer.prefixes if proj else {}
 
+        # col_name -> {"sheets": [str], "all_numeric": bool}
+        seen: Dict[str, dict] = {}
         for sheet_name, df in self._workbook.items():
             for col in df.columns:
-                row = self.cols_table.rowCount()
-                self.cols_table.insertRow(row)
-
-                cb = QCheckBox()
-                cb.setStyleSheet("margin-left: 8px;")
-                # Auto-check if this column was previously bound to a prefix
-                if col in existing:
-                    cb.setChecked(True)
-                self.cols_table.setCellWidget(row, 0, cb)
-
-                self.cols_table.setItem(row, 1, QTableWidgetItem(sheet_name))
-
-                # Mark numeric columns so the user notices the type-loss caveat.
+                col_str = str(col)
                 is_numeric = pd.api.types.is_numeric_dtype(df[col])
-                col_label = f"{col}  （数字列⚠）" if is_numeric else str(col)
-                col_item = QTableWidgetItem(col_label)
-                # Stash the raw column name + numeric flag for later lookup.
-                col_item.setData(Qt.ItemDataRole.UserRole, (str(col), is_numeric))
-                self.cols_table.setItem(row, 2, col_item)
+                info = seen.setdefault(
+                    col_str, {"sheets": [], "all_numeric": True}
+                )
+                info["sheets"].append(sheet_name)
+                # Treat as numeric only if EVERY occurrence is numeric.
+                # If any sheet has it as object/string, the column has mixed
+                # use and the type-loss warning isn't really applicable.
+                info["all_numeric"] = info["all_numeric"] and is_numeric
 
-                edit = QLineEdit()
-                edit.setPlaceholderText("例：GAME（不填则用 COL{n}）")
-                if col in existing:
-                    edit.setText(existing[col])
-                self.cols_table.setCellWidget(row, 3, edit)
+        for col_name, info in seen.items():
+            row = self.cols_table.rowCount()
+            self.cols_table.insertRow(row)
+
+            cb = QCheckBox()
+            cb.setStyleSheet("margin-left: 8px;")
+            if col_name in existing:
+                cb.setChecked(True)
+            self.cols_table.setCellWidget(row, 0, cb)
+
+            # "Where" cell: list sheets, with a count if there are multiple.
+            sheets = info["sheets"]
+            if len(sheets) == 1:
+                where = sheets[0]
+            else:
+                where = f"{len(sheets)} 个 sheet（{', '.join(sheets)}）"
+            self.cols_table.setItem(row, 1, QTableWidgetItem(where))
+
+            # Mark numeric columns so the user notices the type-loss caveat.
+            is_numeric = info["all_numeric"]
+            col_label = f"{col_name}  （数字列⚠）" if is_numeric else col_name
+            col_item = QTableWidgetItem(col_label)
+            col_item.setData(Qt.ItemDataRole.UserRole, (col_name, is_numeric))
+            self.cols_table.setItem(row, 2, col_item)
+
+            edit = QLineEdit()
+            edit.setPlaceholderText("例：GAME（不填则用 COL{n}）")
+            if col_name in existing:
+                edit.setText(existing[col_name])
+            self.cols_table.setCellWidget(row, 3, edit)
 
     def collect_mapping(self) -> Dict[str, str]:
         """Read the table and produce {column_name: prefix}.

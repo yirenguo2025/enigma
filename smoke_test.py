@@ -116,6 +116,33 @@ def main():
     else:
         raise AssertionError("Wrong password was accepted!")
 
+    # 8. Multi-sheet same-column-name regression test
+    #    A common real-world case: an .xlsx with sheets "2021", "2023", "2024",
+    #    each with column "游戏名". Same game name across sheets must get the
+    #    SAME token (project-level consistency).
+    print("\n--- Multi-sheet regression test ---")
+    multi_src = os.path.join(workdir, "annual.xlsx")
+    with pd.ExcelWriter(multi_src) as w:
+        pd.DataFrame({"游戏名": ["原神", "王者荣耀"], "流水": [100, 200]}).to_excel(
+            w, sheet_name="2021", index=False
+        )
+        pd.DataFrame({"游戏名": ["原神", "蛋仔派对"], "流水": [150, 80]}).to_excel(
+            w, sheet_name="2023", index=False
+        )
+        pd.DataFrame({"游戏名": ["王者荣耀", "原神"], "流水": [300, 250]}).to_excel(
+            w, sheet_name="2024", index=False
+        )
+    proj_multi = Project.open(keyfile, password="hunter2")
+    multi_result = encrypt_file(proj_multi, multi_src, {"游戏名": "GAME"})
+    out_sheets = pd.read_excel(multi_result.output_path, sheet_name=None)
+    # Same name -> same token across all sheets
+    tok_yuanshen = out_sheets["2021"].iloc[0]["游戏名"]  # 原神 in row 0 of 2021
+    assert out_sheets["2023"].iloc[0]["游戏名"] == tok_yuanshen, "原神 token mismatch across 2021/2023"
+    assert out_sheets["2024"].iloc[1]["游戏名"] == tok_yuanshen, "原神 token mismatch across 2021/2024"
+    # 流水 column should be untouched (numeric, not in column_prefix_map)
+    assert list(out_sheets["2021"]["流水"]) == [100, 200]
+    print(f"✓ Multi-sheet: 原神 -> {tok_yuanshen} consistent across all 3 sheets")
+
     print(f"\nKept workdir for inspection: {workdir}")
 
 
