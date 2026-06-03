@@ -81,6 +81,19 @@ class EncryptPanel(QWidget):
         file_row.addWidget(self.file_label, 1)
         root.addLayout(file_row)
 
+        # Hint above the columns table
+        hint = QLabel(
+            "默认已勾选所有非数值列，请检查。"
+            "建议尽可能脱敏不需要用于后续数值计算的信息，"
+            "以尽可能脱敏并防止信息反推。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(
+            "color: #444; background: #fff7e6; "
+            "padding: 8px; border: 1px solid #f0d090; border-radius: 4px;"
+        )
+        root.addWidget(hint)
+
         # Columns table
         self.cols_table = QTableWidget(0, 4)
         self.cols_table.setHorizontalHeaderLabels(
@@ -164,7 +177,11 @@ class EncryptPanel(QWidget):
 
             cb = QCheckBox()
             cb.setStyleSheet("margin-left: 8px;")
-            if col_name in existing:
+            # Default-check all non-numeric columns. If a column was previously
+            # bound in this project, also check it (preserve user intent).
+            is_numeric = info["all_numeric"]
+            should_check = (col_name in existing) or (not is_numeric)
+            if should_check:
                 cb.setChecked(True)
             self.cols_table.setCellWidget(row, 0, cb)
 
@@ -177,7 +194,6 @@ class EncryptPanel(QWidget):
             self.cols_table.setItem(row, 1, QTableWidgetItem(where))
 
             # Mark numeric columns so the user notices the type-loss caveat.
-            is_numeric = info["all_numeric"]
             col_label = f"{col_name}  （数字列⚠）" if is_numeric else col_name
             col_item = QTableWidgetItem(col_label)
             col_item.setData(Qt.ItemDataRole.UserRole, (col_name, is_numeric))
